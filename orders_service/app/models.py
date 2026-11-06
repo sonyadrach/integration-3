@@ -25,6 +25,8 @@ class Order(Base):
         server_default=func.now(),
         nullable=False,
     )
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
+
 class User(Base):
     """Database model representing a registered user."""
 
