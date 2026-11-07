@@ -1,4 +1,5 @@
 from datetime import datetime
+from typing import List, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -52,3 +53,14 @@ class Token(BaseModel):
 
 class TokenData(BaseModel):
     username: str | None = None
+
+class BatchOrderResult(BaseModel):
+    index: int
+    order_id: int
+    status: str
+    predicted_price: Optional[float] = None
+    error: Optional[str] = None
+
+class BatchOrderResponse(BaseModel):
+    total: int
+    results: List[BatchOrderResult]

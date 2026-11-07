@@ -2,7 +2,9 @@ import logging
 import os
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-
+import asyncio
+from contextlib import asynccontextmanager
+from typing import List
 import httpx
 import jwt
 from dotenv import load_dotenv
@@ -42,6 +44,9 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(
     os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30")
 )
 
+BATCH_MAX_ITEMS = int(
+    os.getenv("BATCH_MAX_ITEMS", "50")
+)
 FORECAST_FEATURE_KEYS = {
     "gr_liv_area",
     "total_bsmt_sf",
@@ -54,6 +59,17 @@ FORECAST_FEATURE_KEYS = {
 ALGORITHM = "HS256"
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
+
+http_client: httpx.AsyncClient = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global http_client
+    http_client = httpx.AsyncClient(timeout=FORECAST_TIMEOUT)
+    yield
+    await http_client.aclose()
+
+Base.metadata.create_all(bind=engine)
 
 def get_jwt_secret() -> str:
     """Read the JWT signing key exclusively from the Docker secret file."""
@@ -104,15 +120,13 @@ def get_current_user(
 
     return user
 
-
-# Tables are created automatically for the initial version.
 Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="Orders API",
     version="0.2.0",
+    lifespan=lifespan,
 )
-
 
 @retry(
     stop=stop_after_attempt(2),
@@ -131,6 +145,17 @@ def _request_prediction(payload: dict) -> float:
         )
         response.raise_for_status()
         return float(response.json()["predicted_price"])
+
+async def _request_prediction_async(payload: dict) -> float:
+    """Async request a price prediction from the forecasting service."""
+    model_payload = {k: v for k, v in payload.items() if k in FORECAST_FEATURE_KEYS}
+    
+    response = await http_client.post(
+        f"{FORECAST_URL}/predict",
+        json=model_payload,
+    )
+    response.raise_for_status()
+    return float(response.json()["predicted_price"])
 
 
 # --- Public Endpoints ---
@@ -180,7 +205,6 @@ def login(
 ):
     """OAuth2 password flow login yielding a Bearer JWT."""
     user = db.query(models.User).filter(models.User.username == form_data.username).first()
-    # Однакове повідомлення про помилку для захисту від enumeration-атак
     if user is None or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
@@ -232,6 +256,60 @@ def create_order(
         db,
         data,
         price,
+    )
+
+@app.post(
+    "/orders/batch",
+    response_model=schemas.BatchOrderResponse,
+    status_code=status.HTTP_200_OK,
+)
+async def create_orders_batch(
+    orders_in: List[schemas.OrderCreate],
+    db: Session = Depends(get_db),
+    current_user: models.User = Depends(get_current_user),
+):
+    """Create a batch of orders and fetch predictions concurrently."""
+    if len(orders_in) > BATCH_MAX_ITEMS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Maximum batch size is {BATCH_MAX_ITEMS}",
+        )
+
+    db_orders = []
+    for order_data in orders_in:
+        new_order = crud.create_order(db, order_data, price=None)
+        db_orders.append(new_order)
+
+    tasks = []
+    for order_data in orders_in:
+        tasks.append(_request_prediction_async(order_data.model_dump()))
+
+    forecast_results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    results_out = []
+    for idx, (order_db, forecast_res) in enumerate(zip(db_orders, forecast_results)):
+        result_item = schemas.BatchOrderResult(
+            index=idx, 
+            order_id=order_db.id, 
+            status=""
+        )
+        
+        if isinstance(forecast_res, Exception):
+            logger.warning(f"Batch prediction failed for order {order_db.id}: {forecast_res}")
+            result_item.status = "failed"
+            result_item.error = str(forecast_res)
+        else:
+            order_db.predicted_price = forecast_res
+            result_item.status = "priced"
+            result_item.predicted_price = forecast_res
+            
+        results_out.append(result_item)
+
+    db.commit()
+
+    return schemas.BatchOrderResponse(
+        total=len(orders_in),
+        results=results_out
     )
 
 
@@ -354,3 +432,4 @@ def delete_order(
         )
 
     crud.delete_order(db, order)
+
