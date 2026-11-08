@@ -7,3 +7,4 @@ artifacts/
 *.csv
 secrets/db_password
 secrets/jwt_secret_key
+batch10.json

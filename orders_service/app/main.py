@@ -391,6 +391,7 @@ def get_order(
 def update_order(
     oid: int,
     data: schemas.OrderUpdate,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
@@ -404,33 +405,24 @@ def update_order(
         )
 
     update_dict = data.model_dump(exclude_unset=True)
-    new_price = None
+    if not update_dict:
+        return order
+
+    order = crud.update_order(db, order, data)
 
     has_property_changes = any(field in FORECAST_FEATURE_KEYS for field in update_dict)
 
     if has_property_changes:
-        features = {}
-        for field in FORECAST_FEATURE_KEYS:
-            if field in update_dict:
-                features[field] = update_dict[field]
-            else:
-                features[field] = getattr(order, field)
+        order.status = "pending"
+        
+        order.predicted_price = None
+        
+        db.commit()
+        db.refresh(order)
 
-        try:
-            new_price = _request_prediction(features)
-        except Exception as exc:
-            logger.warning(
-                "Forecast service unavailable during PATCH for order %s: %s. Keeping previous price.",
-                oid,
-                exc,
-            )
+        background_tasks.add_task(process_order_forecast_background, order.id)
 
-    return crud.update_order(
-        db,
-        order,
-        data,
-        new_price=new_price,
-    )
+    return order
 
 
 @app.delete(
