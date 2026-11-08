@@ -8,7 +8,7 @@ from typing import List
 import httpx
 import jwt
 from dotenv import load_dotenv
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, HTTPException, status, BackgroundTasks, Response
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from passlib.context import CryptContext
 from sqlalchemy.orm import Session
@@ -20,7 +20,7 @@ from tenacity import (
 )
 
 from . import crud, models, schemas
-from .database import Base, engine, get_db
+from .database import Base, engine, get_db, SessionLocal
 
 load_dotenv()
 
@@ -157,7 +157,32 @@ async def _request_prediction_async(payload: dict) -> float:
     response.raise_for_status()
     return float(response.json()["predicted_price"])
 
+async def process_order_forecast_background(order_id: int):
+    """Фонова задача для отримання прогнозу."""
+    db: Session = SessionLocal() 
+    try:
+        order = db.query(models.Order).filter(models.Order.id == order_id).first()
+        if not order:
+            logger.warning("Order %s was deleted before background processing started.", order_id)
+            return
 
+        features = {k: getattr(order, k) for k in FORECAST_FEATURE_KEYS}
+        
+        try:
+            price = await _request_prediction_async(features)
+            
+            order.predicted_price = price
+            order.status = "priced"
+            
+            logger.info("Order %s forecast success: %s USD at %s", order_id, price, datetime.now(timezone.utc).isoformat())
+            
+        except Exception as exc:
+            order.status = "failed"
+            logger.error("Order %s forecast failed: %s at %s", order_id, exc, datetime.now(timezone.utc).isoformat())
+        
+        db.commit()
+    finally:
+        db.close()
 # --- Public Endpoints ---
 
 @app.get("/health")
@@ -232,31 +257,26 @@ def read_current_user(
 @app.post(
     "/orders",
     response_model=schemas.OrderRead,
-    status_code=status.HTTP_201_CREATED,
+    status_code=status.HTTP_202_ACCEPTED, 
 )
-def create_order(
+async def create_order(
     data: schemas.OrderCreate,
+    background_tasks: BackgroundTasks, 
+    response: Response,                
     db: Session = Depends(get_db),
     current_user: models.User = Depends(get_current_user),
 ):
-    """Create an order (Graceful Degradation if forecast fails)."""
-    try:
-        price = _request_prediction(data.model_dump())
-    except (httpx.RequestError, httpx.HTTPStatusError) as exc:
-        logger.warning(
-            "Forecast service unavailable or returned error: %s. Proceeding with price=None.",
-            exc,
-        )
-        price = None
-    except Exception as exc:
-        logger.warning("Unexpected error during price prediction: %s", exc)
-        price = None
-
-    return crud.create_order(
+    """Create an order and schedule forecast calculation in the background."""
+    
+    new_order = crud.create_order(
         db,
         data,
-        price,
+        price=None, 
     )
+    background_tasks.add_task(process_order_forecast_background, new_order.id)
+    response.headers["Location"] = f"/orders/{new_order.id}"
+    
+    return new_order
 
 @app.post(
     "/orders/batch",

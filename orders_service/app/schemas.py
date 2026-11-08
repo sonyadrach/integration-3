@@ -31,7 +31,7 @@ class OrderRead(OrderBase):
     id: int
     predicted_price: float | None = None
     created_at: datetime
-    status: str
+    status: str = "pending"
 
     model_config = ConfigDict(from_attributes=True)
 
